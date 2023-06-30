@@ -1,13 +1,12 @@
-#!/usr/bin/python
 # encoding: utf-8
 #
-# Copyright 2010-2014 Greg Neagle.
+# Copyright 2010-2023 Greg Neagle.
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an 'AS IS' BASIS,
@@ -22,6 +21,7 @@ Created by Greg Neagle on 2014-05-15.
 
 Functions to work with product images ('icons') for Managed Software Center
 """
+from __future__ import absolute_import, print_function
 
 import glob
 import os
@@ -29,40 +29,67 @@ import shutil
 import subprocess
 import tempfile
 
-import munkicommon
-import FoundationPlist
-
 # PyLint cannot properly find names inside Cocoa libraries, so issues bogus
 # No name 'Foo' in module 'Bar' warnings. Disable them.
 # pylint: disable=E0611
-from Foundation import NSData
-from AppKit import NSBitmapImageRep, NSPNGFileType
+from Foundation import NSURL
+from Quartz import (CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex,
+                    CGImageDestinationCreateWithURL, CGImageDestinationAddImage,
+                    CGImageDestinationFinalize,
+                    CGImageSourceGetCount, CGImageSourceCopyPropertiesAtIndex,
+                    kCGImagePropertyDPIHeight, kCGImagePropertyPixelHeight)
 # pylint: enable=E0611
+
+from . import display
+from .wrappers import readPlist, PlistReadError
+
 
 # we use lots of camelCase-style names. Deal with it.
 # pylint: disable=C0103
 
 
-def convertIconToPNG(icon_path, destination_path, desired_pixel_height=350):
+def convertIconToPNG(icon_path, destination_path,
+                     desired_pixel_height=350, desired_dpi=72):
     '''Converts an icns file to a png file, choosing the representation
     closest to (but >= if possible) the desired_pixel_height.
     Returns True if successful, False otherwise'''
-    if os.path.exists(icon_path):
-        image_data = NSData.dataWithContentsOfFile_(icon_path)
-        bitmap_reps = NSBitmapImageRep.imageRepsWithData_(image_data)
-        chosen_rep = None
-        for bitmap_rep in bitmap_reps:
-            if not chosen_rep:
-                chosen_rep = bitmap_rep
-            elif (bitmap_rep.pixelsHigh() >= desired_pixel_height
-                  and bitmap_rep.pixelsHigh() < chosen_rep.pixelsHigh()):
-                chosen_rep = bitmap_rep
-        if chosen_rep:
-            png_data = chosen_rep.representationUsingType_properties_(
-                NSPNGFileType, None)
-            png_data.writeToFile_atomically_(destination_path, False)
-            return True
-    return False
+    icns_url = NSURL.fileURLWithPath_(icon_path)
+    png_url = NSURL.fileURLWithPath_(destination_path)
+
+    image_source = CGImageSourceCreateWithURL(icns_url, None)
+    if not image_source:
+        return False
+    number_of_images = CGImageSourceGetCount(image_source)
+    if number_of_images == 0:
+        return False
+
+    selected_index = 0
+    candidate = {}
+    # iterate through the individual icon sizes to find the "best" one
+    for index in range(number_of_images):
+        try:
+            properties = CGImageSourceCopyPropertiesAtIndex(
+                image_source, index, None)
+            # perform not empty check for properties to prevent crash as CGImageSourceCopyPropertiesAtIndex sometimes fails in 10.15.4 and above
+            if not properties:
+                return False
+            dpi = int(properties.get(kCGImagePropertyDPIHeight, 0))
+            height = int(properties.get(kCGImagePropertyPixelHeight, 0))
+            if (not candidate or
+                    (height < desired_pixel_height and
+                     height > candidate['height']) or
+                    (height >= desired_pixel_height and
+                     height < candidate['height']) or
+                    (height == candidate['height'] and dpi == desired_dpi)):
+                candidate = {'index': index, 'dpi': dpi, 'height': height}
+                selected_index = index
+        except ValueError:
+            pass
+
+    image = CGImageSourceCreateImageAtIndex(image_source, selected_index, None)
+    image_dest = CGImageDestinationCreateWithURL(png_url, 'public.png', 1, None)
+    CGImageDestinationAddImage(image_dest, image, None)
+    return CGImageDestinationFinalize(image_dest)
 
 
 def findIconForApp(app_path):
@@ -70,9 +97,9 @@ def findIconForApp(app_path):
     if not os.path.exists(app_path):
         return None
     try:
-        info = FoundationPlist.readPlist(
+        info = readPlist(
             os.path.join(app_path, u'Contents/Info.plist'))
-    except FoundationPlist.FoundationPlistException:
+    except PlistReadError:
         return None
     app_name = os.path.basename(app_path)
     icon_filename = info.get('CFBundleIconFile', app_name)
@@ -108,9 +135,9 @@ def extractAppIconsFromFlatPkg(pkg_path):
     proc = subprocess.Popen(cmd, shell=False, bufsize=-1,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
-    output = proc.communicate()[0]
+    output = proc.communicate()[0].decode('UTF-8')
     if proc.returncode:
-        munkicommon.display_error(u'Could not get bom files from %s', pkg_path)
+        display.display_error(u'Could not get bom files from %s', pkg_path)
         return []
     bomfilepaths = output.splitlines()
     pkg_dict = {}
@@ -125,13 +152,13 @@ def extractAppIconsFromFlatPkg(pkg_path):
         proc = subprocess.Popen(cmd, shell=False, bufsize=-1,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        output = proc.communicate()[0]
+        output = proc.communicate()[0].decode('UTF-8')
         if proc.returncode:
-            munkicommon.display_error(u'Could not lsbom %s', bomfile)
+            display.display_error(u'Could not lsbom %s', bomfile)
         # record paths to all app Info.plist files
         pkg_dict[pkgname] = [
             os.path.normpath(line)
-            for line in output.decode('utf-8').splitlines()
+            for line in output.splitlines()
             if line.endswith(u'.app/Contents/Info.plist')]
         if not pkg_dict[pkgname]:
             # remove empty lists
@@ -156,52 +183,69 @@ def extractAppIconsFromFlatPkg(pkg_path):
                     if icon_path:
                         icon_paths.append(icon_path)
             else:
-                munkicommon.display_error(
+                display.display_error(
                     u'pax could not read files from %s', archive_path)
                 return []
     else:
-        munkicommon.display_error(u'Could not expand %s', pkg_path)
+        display.display_error(u'Could not expand %s', pkg_path)
     # clean up our expanded flat package; we no longer need it
     shutil.rmtree(pkgtmp)
     return icon_paths
 
 
-def findInfoPlistPathsInBundlePkg(pkg_path):
+def findInfoPlistPathsInBundlePkg(pkg_path, repo=None):
     '''Returns a dict with pkg paths as keys and filename lists
     as values'''
     pkg_dict = {}
-    bomfile = os.path.join(pkg_path, u'Contents/Archive.bom')
+    if repo:
+        repo_bomfile = repo.join(pkg_path, u'Contents/Archive.bom')
+        handle = repo.open(repo_bomfile, 'r')
+        bomfile = handle.local_path
+    else:
+        bomfile = os.path.join(pkg_path, u'Contents/Archive.bom')
     if os.path.exists(bomfile):
-        info_paths = getAppInfoPathsFromBundleComponentPkg(pkg_path)
+        info_paths = getAppInfoPathsFromBOM(bomfile)
         if info_paths:
             pkg_dict[pkg_path] = info_paths
     else:
         # mpkg or dist pkg; look for component pkgs within
         pkg_dict = {}
-        original_dir = os.getcwd()
-        pkg_contents_dir = os.path.join(pkg_path, u'Contents')
-        if os.path.isdir(pkg_contents_dir):
-            os.chdir(pkg_contents_dir)
-            pkgs = (glob.glob('*.pkg') + glob.glob('*/*.pkg')
-                    + glob.glob('*/*/*.pkg') + glob.glob('*.mpkg') +
-                    glob.glob('*/*.mpkg') + glob.glob('*/*/*.mpkg'))
-            os.chdir(original_dir)
+        pkgs = []
+        if repo:
+            pkg_contents_dir = repo.join(pkg_path, u'Contents')
+            if repo.isdir(pkg_contents_dir):
+                pkgs = repo.glob(
+                    pkg_contents_dir, '*.pkg', '*/*.pkg', '*/*/*.pkg',
+                    '*.mpkg', '*/*.mpkg', '*/*/*.mpkg')
         else:
-            pkgs = []
+            pkg_contents_dir = os.path.join(pkg_path, u'Contents')
+            if os.path.isdir(pkg_contents_dir):
+                original_dir = os.getcwd()
+                os.chdir(pkg_contents_dir)
+                pkgs = (glob.glob('*.pkg') + glob.glob('*/*.pkg')
+                        + glob.glob('*/*/*.pkg') + glob.glob('*.mpkg') +
+                        glob.glob('*/*.mpkg') + glob.glob('*/*/*.mpkg'))
+                os.chdir(original_dir)
         for pkg in pkgs:
             full_path = os.path.join(pkg_contents_dir, pkg)
             pkg_dict.update(findInfoPlistPathsInBundlePkg(full_path))
     return pkg_dict
 
 
-def extractAppIconsFromBundlePkg(pkg_path):
+def extractAppIconsFromBundlePkg(pkg_path, repo=None):
     '''Returns a list of paths for application icons found
     inside the bundle pkg at pkg_path'''
-    pkg_dict = findInfoPlistPathsInBundlePkg(pkg_path)
+    pkg_dict = findInfoPlistPathsInBundlePkg(pkg_path, repo)
     icon_paths = []
     exporttmp = tempfile.mkdtemp(dir='/tmp')
     for pkg in pkg_dict:
-        archive_path = os.path.join(pkg, u'Contents/Archive.pax.gz')
+        handle = None
+        if repo:
+            repo_archive_path = repo.join(pkg, u'Contents/Archive.pax.gz')
+            handle = repo.open(repo_archive_path, 'r')
+            archive_path = handle.local_path
+        else:
+            archive_path = os.path.join(pkg, u'Contents/Archive.pax.gz')
         err = extractAppBitsFromPkgArchive(archive_path, exporttmp)
         if err == 0:
             for info_path in pkg_dict[pkg]:
@@ -213,15 +257,18 @@ def extractAppIconsFromBundlePkg(pkg_path):
     return icon_paths
 
 
-def getAppInfoPathsFromBundleComponentPkg(pkg_path):
+def getAppInfoPathsFromBOM(bomfile):
     '''Returns a list of paths to application Info.plists'''
-    bomfile = os.path.join(pkg_path, u'Contents/Archive.bom')
     if os.path.exists(bomfile):
         cmd = ['/usr/bin/lsbom', '-s', bomfile]
         proc = subprocess.Popen(cmd, shell=False, bufsize=-1,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        output = proc.communicate()[0]
+        output = proc.communicate()[0].decode('UTF-8')
         return [line for line in output.splitlines()
                 if line.endswith('.app/Contents/Info.plist')]
     return []
+
+
+if __name__ == '__main__':
+    print('This is a library of support tools for the Munki Suite.')

@@ -1,13 +1,13 @@
-#!/usr/bin/python
+#!/usr/local/munki/munki-python
 # encoding: utf-8
 #
-# Copyright 2010-2014 Greg Neagle.
+# Copyright 2010-2023 Greg Neagle.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,18 +25,24 @@ Prevents multiple copies of the app from being launched
 when Fast User Switching is in use
 Intended for use by a launchd LaunchAgent.
 """
+from __future__ import absolute_import, print_function
 
 import sys
 import os
 import subprocess
 import time
 
+# PyLint cannot properly find names inside Cocoa libraries, so issues bogus
+# No name 'Foo' in module 'Bar' warnings. Disable them.
+# pylint: disable=E0611
+from SystemConfiguration import SCDynamicStoreCopyConsoleUser
+# pylint: enable=E0611
+
 
 def getconsoleuser():
     '''Uses Apple's SystemConfiguration framework to get the current
     console user'''
-    from SystemConfiguration import SCDynamicStoreCopyConsoleUser
-    cfuser = SCDynamicStoreCopyConsoleUser( None, None, None )
+    cfuser = SCDynamicStoreCopyConsoleUser(None, None, None)
     return cfuser[0]
 
 
@@ -51,13 +57,13 @@ def main():
         # is undefined, so we'll return root (the effective user)
         thisuser = "root"
 
-    if (consoleuser == thisuser) or \
-        (consoleuser == None and thisuser == "root"):
+    if (consoleuser == thisuser or
+            (consoleuser is None and thisuser == "root")):
         cmd = ["/usr/bin/open"]
         if len(sys.argv) > 1:
             cmd.extend(sys.argv[1:])
         else:
-            print >> sys.stderr, "Must specify an app to launch!"
+            print("Must specify an app to launch!", file=sys.stderr)
             exit(-1)
         retcode = subprocess.call(cmd)
         # sleep 10 secs to make launchd happy
@@ -72,4 +78,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

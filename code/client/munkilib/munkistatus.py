@@ -1,13 +1,12 @@
-#!/usr/bin/python
 # encoding: utf-8
 #
-# Copyright 2009-2014 Greg Neagle.
+# Copyright 2009-2023 Greg Neagle.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +21,7 @@ Created by Greg Neagle on 2009-09-24.
 Utility functions for using MunkiStatus.app
 to display status and progress.
 """
+from __future__ import absolute_import, print_function
 
 import os
 import time
@@ -139,7 +139,7 @@ def activate():
     _currentStatus['command'] = ''
 
 
-def quit():
+def quit_app():
     '''Tells the status app that we're done.'''
     _currentStatus['command'] = 'quit'
     postStatusNotification()
@@ -156,3 +156,6 @@ def restartAlert():
     # should not persist between notifications
     _currentStatus['command'] = ''
 
+
+if __name__ == '__main__':
+    print('This is a library of support tools for the Munki Suite.')

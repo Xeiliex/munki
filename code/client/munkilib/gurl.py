@@ -1,13 +1,12 @@
-#!/usr/bin/python
 # encoding: utf-8
 #
-# Copyright 2009-2014 Greg Neagle.
+# Copyright 2009-2023 Greg Neagle.
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an 'AS IS' BASIS,
@@ -18,30 +17,145 @@
 gurl.py
 
 Created by Greg Neagle on 2013-11-21.
+Modified in Feb 2016 to add support for NSURLSession.
+Updated June 2019 for compatibility with Python 3 and PyObjC 5.1.2+
+Updated May 2022 for compatibilty with PyObjC 8.5 on macOS Mojave
 
 curl replacement using NSURLConnection and friends
+
 """
+from __future__ import absolute_import, print_function
 
 import os
 import xattr
 
+try:
+    # Python 2
+    from urlparse import urlparse
+except ImportError:
+    # Python 3
+    from urllib.parse import urlparse
+
+
+# builtin super doesn't work with Cocoa classes in recent PyObjC releases.
+# pylint: disable=redefined-builtin,no-name-in-module
+from objc import super
+# pylint: enable=redefined-builtin,no-name-in-module
+
 # PyLint cannot properly find names inside Cocoa libraries, so issues bogus
 # No name 'Foo' in module 'Bar' warnings. Disable them.
 # pylint: disable=E0611
-from Foundation import NSRunLoop, NSDate
-from Foundation import NSObject, NSURL, NSURLConnection
-from Foundation import NSMutableURLRequest
-from Foundation import NSURLRequestReloadIgnoringLocalCacheData
-from Foundation import NSURLResponseUnknownLength
-from Foundation import NSLog
-from Foundation import NSURLCredential, NSURLCredentialPersistenceNone
-from Foundation import NSPropertyListSerialization
-from Foundation import NSPropertyListMutableContainersAndLeaves
-from Foundation import NSPropertyListXMLFormat_v1_0
-# pylint: enable=E0611
+
+
+from Foundation import (NSBundle, NSRunLoop, NSData, NSDate,
+                        NSObject, NSURL, NSURLConnection,
+                        NSMutableURLRequest,
+                        NSURLRequestReloadIgnoringLocalCacheData,
+                        NSURLResponseUnknownLength,
+                        NSLog,
+                        NSURLCredential, NSURLCredentialPersistenceNone,
+                        NSPropertyListSerialization,
+                        NSPropertyListMutableContainersAndLeaves,
+                        NSPropertyListXMLFormat_v1_0)
+
+from Security import (errSecSuccess,
+                      kCFBooleanTrue,
+                      kSecClass, kSecClassIdentity,
+                      kSecMatchLimit, kSecMatchLimitAll,
+                      kSecReturnRef,
+                      SecCertificateCopyData, SecIdentityCopyCertificate,
+                      SecIdentityGetTypeID,
+                      SecItemCopyMatching)
+
+from asn1crypto.x509 import Certificate, Name
+
+
+# patch the credentialWithIdentity:certificates:persistence: signature
+# see https://github.com/ronaldoussoren/pyobjc/issues/320#issuecomment-784278944
+# more changes May 2022 to work around some issues with PyObjC 8.5 and
+# macOS Mojave (and presumably earlier)
+import objc
+objc.registerCFSignature(
+    "SecIdentityRef",
+    b"^{__SecIdentity=}", SecIdentityGetTypeID()
+)
+objc.registerMetaDataForSelector(
+    b'NSURLCredential',
+    b'credentialWithIdentity:certificates:persistence:',
+    {'arguments': {
+       2: {'null_accepted': False, 'type': b'^{__SecIdentity=}'},
+     },
+     'classmethod': True,
+     'hidden': False,
+     'retval': {'_template': True, 'type': b"@"}}
+)
+
+try:
+    from Foundation import (NSURLSession, NSURLSessionConfiguration,
+                            NSURLCredentialPersistenceForSession)
+    from CFNetwork import (kCFNetworkProxiesHTTPSEnable,
+                           kCFNetworkProxiesHTTPEnable)
+    NSURLSESSION_AVAILABLE = True
+except ImportError:
+    NSURLSESSION_AVAILABLE = False
 
 # Disable PyLint complaining about 'invalid' names
 # pylint: disable=C0103
+
+if NSURLSESSION_AVAILABLE:
+    # NSURLSessionAuthChallengeDisposition enum constants
+    NSURLSessionAuthChallengeUseCredential = 0
+    NSURLSessionAuthChallengePerformDefaultHandling = 1
+    NSURLSessionAuthChallengeCancelAuthenticationChallenge = 2
+    NSURLSessionAuthChallengeRejectProtectionSpace = 3
+
+    # NSURLSessionResponseDisposition enum constants
+    NSURLSessionResponseCancel = 0
+    NSURLSessionResponseAllow = 1
+    NSURLSessionResponseBecomeDownload = 2
+
+    # TLS/SSLProtocol enum constants
+    kSSLProtocolUnknown = 0
+    kSSLProtocol3 = 2
+    kTLSProtocol1 = 4
+    kTLSProtocol11 = 7
+    kTLSProtocol12 = 8
+    kDTLSProtocol1 = 9
+
+    # define a helper function for block callbacks
+    import ctypes
+    import objc
+    CALLBACK_HELPER_AVAILABLE = True
+    try:
+        _objc_so = ctypes.cdll.LoadLibrary(
+            os.path.join(objc.__path__[0], '_objc.so'))
+    except OSError:
+        # could not load _objc.so
+        CALLBACK_HELPER_AVAILABLE = False
+    else:
+        PyObjCMethodSignature_WithMetaData = (
+            _objc_so.PyObjCMethodSignature_WithMetaData)
+        PyObjCMethodSignature_WithMetaData.restype = ctypes.py_object
+
+        def objc_method_signature(signature_str):
+            '''Return a PyObjCMethodSignature given a call signature in string
+            format'''
+            return PyObjCMethodSignature_WithMetaData(
+                ctypes.create_string_buffer(signature_str), None, False)
+
+# pylint: enable=E0611
+
+# disturbing hack warning!
+# this works around an issue with App Transport Security on 10.11
+bundle = NSBundle.mainBundle()
+info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+info['NSAppTransportSecurity'] = {'NSAllowsArbitraryLoads': True}
+
+
+def NSLogWrapper(message):
+    '''A wrapper function for NSLog to prevent format string errors'''
+    NSLog('%@', message)
+
 
 ssl_error_codes = {
     -9800: u'SSL protocol error',
@@ -98,7 +212,7 @@ ssl_error_codes = {
 
 class Gurl(NSObject):
     '''A class for getting content from a URL
-       using NSURLConnection and friends'''
+       using NSURLConnection/NSURLSession and friends'''
 
     # since we inherit from NSObject, PyLint issues a few bogus warnings
     # pylint: disable=W0232,E1002
@@ -113,9 +227,10 @@ class Gurl(NSObject):
         '''Set up our Gurl object'''
         self = super(Gurl, self).init()
         if not self:
-            return
+            return None
 
         self.follow_redirects = options.get('follow_redirects', False)
+        self.ignore_system_proxy = options.get('ignore_system_proxy', False)
         self.destination_path = options.get('file')
         self.can_resume = options.get('can_resume', False)
         self.url = options.get('url')
@@ -125,9 +240,12 @@ class Gurl(NSObject):
         self.download_only_if_changed = options.get(
             'download_only_if_changed', False)
         self.cache_data = options.get('cache_data')
-        self.connection_timeout = options.get('connection_timeout', 10)
+        self.connection_timeout = options.get('connection_timeout', 60)
+        if NSURLSESSION_AVAILABLE:
+            self.minimum_tls_protocol = options.get(
+                'minimum_tls_protocol', kTLSProtocol1)
 
-        self.log = options.get('logging_function', NSLog)
+        self.log = options.get('logging_function', NSLogWrapper)
 
         self.resume = False
         self.response = None
@@ -142,6 +260,8 @@ class Gurl(NSObject):
         self.expectedLength = -1
         self.percentComplete = 0
         self.connection = None
+        self.session = None
+        self.task = None
         return self
 
     def start(self):
@@ -160,7 +280,7 @@ class Gurl(NSObject):
                 request.setValue_forHTTPHeaderField_(value, header)
         # does the file already exist? See if we can resume a partial download
         if os.path.isfile(self.destination_path):
-            stored_data = self.get_stored_headers()
+            stored_data = self.getStoredHeaders()
             if (self.can_resume and 'expected-length' in stored_data and
                     ('last-modified' in stored_data or 'etag' in stored_data)):
                 # we have a partial file and we're allowed to resume
@@ -169,25 +289,48 @@ class Gurl(NSObject):
                 byte_range = 'bytes=%s-' % local_filesize
                 request.setValue_forHTTPHeaderField_(byte_range, 'Range')
         if self.download_only_if_changed and not self.resume:
-            stored_data = self.cache_data or self.get_stored_headers()
+            stored_data = self.cache_data or self.getStoredHeaders()
             if 'last-modified' in stored_data:
                 request.setValue_forHTTPHeaderField_(
                     stored_data['last-modified'], 'if-modified-since')
             if 'etag' in stored_data:
                 request.setValue_forHTTPHeaderField_(
                     stored_data['etag'], 'if-none-match')
-        self.connection = NSURLConnection.alloc().initWithRequest_delegate_(
-            request, self)
+        if NSURLSESSION_AVAILABLE:
+            configuration = (
+                NSURLSessionConfiguration.defaultSessionConfiguration())
+
+            # optional: ignore system http/https proxies (10.9+ only)
+            if self.ignore_system_proxy is True:
+                configuration.setConnectionProxyDictionary_(
+                    {kCFNetworkProxiesHTTPEnable: False,
+                     kCFNetworkProxiesHTTPSEnable: False})
+
+            # set minimum supported TLS protocol (defaults to TLS1)
+            configuration.setTLSMinimumSupportedProtocol_(
+                self.minimum_tls_protocol)
+
+            self.session = (
+                NSURLSession.sessionWithConfiguration_delegate_delegateQueue_(
+                    configuration, self, None))
+            self.task = self.session.dataTaskWithRequest_(request)
+            self.task.resume()
+        else:
+            self.connection = NSURLConnection.alloc().initWithRequest_delegate_(
+                request, self)
 
     def cancel(self):
         '''Cancel the connection'''
         if self.connection:
-            self.connection.cancel()
+            if NSURLSESSION_AVAILABLE:
+                self.session.invalidateAndCancel()
+            else:
+                self.connection.cancel()
             self.done = True
 
     def isDone(self):
         '''Check if the connection request is complete. As a side effect,
-        allow the delegates to work my letting the run loop run for a bit'''
+        allow the delegates to work by letting the run loop run for a bit'''
         if self.done:
             return self.done
         # let the delegates do their thing
@@ -195,41 +338,44 @@ class Gurl(NSObject):
             NSDate.dateWithTimeIntervalSinceNow_(.1))
         return self.done
 
-    def get_stored_headers(self):
+    def getStoredHeaders(self):
         '''Returns any stored headers for self.destination_path'''
         # try to read stored headers
         try:
-            stored_plist_str = xattr.getxattr(
+            stored_plist_bytestr = xattr.getxattr(
                 self.destination_path, self.GURL_XATTR)
         except (KeyError, IOError):
             return {}
-        data = buffer(stored_plist_str)
-        dataObject, plistFormat, error = (
+        data = NSData.dataWithBytes_length_(
+            stored_plist_bytestr, len(stored_plist_bytestr))
+        dataObject, _plistFormat, error = (
             NSPropertyListSerialization.
             propertyListFromData_mutabilityOption_format_errorDescription_(
                 data, NSPropertyListMutableContainersAndLeaves, None, None))
         if error:
             return {}
-        else:
-            return dataObject
+        return dataObject
 
-    def store_headers(self, headers):
+    def storeHeaders_(self, headers):
         '''Store dictionary data as an xattr for self.destination_path'''
         plistData, error = (
             NSPropertyListSerialization.
             dataFromPropertyList_format_errorDescription_(
                 headers, NSPropertyListXMLFormat_v1_0, None))
         if error:
-            string = ''
+            byte_string = b''
         else:
-            string = str(plistData)
+            try:
+                byte_string = bytes(plistData)
+            except NameError:
+                byte_string = str(plistData)
         try:
-            xattr.setxattr(self.destination_path, self.GURL_XATTR, string)
-        except IOError, err:
+            xattr.setxattr(self.destination_path, self.GURL_XATTR, byte_string)
+        except IOError as err:
             self.log('Could not store metadata to %s: %s'
                      % (self.destination_path, err))
 
-    def normalize_header_dict(self, a_dict):
+    def normalizeHeaderDict_(self, a_dict):
         '''Since HTTP header names are not case-sensitive, we normalize a
         dictionary of HTTP headers by converting all the key names to
         lower case'''
@@ -242,13 +388,8 @@ class Gurl(NSObject):
             new_dict[key.lower()] = value
         return new_dict
 
-    def connection_didFailWithError_(self, connection, error):
-        '''NSURLConnection delegate method
-        Sent when a connection fails to load its request successfully.'''
-
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
+    def recordError_(self, error):
+        '''Record any error info from completed connection/session'''
         self.error = error
         # If this was an SSL error, try to extract the SSL error code.
         if 'NSUnderlyingError' in error.userInfo():
@@ -257,33 +398,46 @@ class Gurl(NSObject):
             if ssl_code:
                 self.SSLerror = (ssl_code, ssl_error_codes.get(
                     ssl_code, 'Unknown SSL error'))
-        self.done = True
-        if self.destination and self.destination_path:
-            self.destination.close()
-            # delete it? Might not want to...
 
-    def connectionDidFinishLoading_(self, connection):
-        '''NSURLConnectionDataDelegat delegate method
-        Sent when a connection has finished loading successfully.'''
-
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
-        self.done = True
-        if self.destination and self.destination_path:
-            self.destination.close()
+    def removeExpectedSizeFromStoredHeaders(self):
+        '''If a successful transfer, clear the expected size so we
+        don\'t attempt to resume the download next time'''
         if str(self.status).startswith('2'):
             # remove the expected-size from the stored headers
-            headers = self.get_stored_headers()
+            headers = self.getStoredHeaders()
             if 'expected-length' in headers:
                 del headers['expected-length']
-                self.store_headers(headers)
+                self.storeHeaders_(headers)
 
-    def connection_didReceiveResponse_(self, connection, response):
-        '''NSURLConnectionDataDelegate delegate method
-        Sent when the connection has received sufficient data to construct the
-        URL response for its request.'''
+    def URLSession_task_didCompleteWithError_(self, _session, _task, error):
+        '''NSURLSessionTaskDelegate method.'''
+        if self.destination and self.destination_path:
+            self.destination.close()
+        if error:
+            self.recordError_(error)
+        else:
+            self.removeExpectedSizeFromStoredHeaders()
+        self.done = True
 
+    def connection_didFailWithError_(self, _connection, error):
+        '''NSURLConnectionDelegate method
+        Sent when a connection fails to load its request successfully.'''
+        self.recordError_(error)
+        self.done = True
+        if self.destination and self.destination_path:
+            self.destination.close()
+
+    def connectionDidFinishLoading_(self, _connection):
+        '''NSURLConnectionDataDelegate method
+        Sent when a connection has finished loading successfully.'''
+        self.done = True
+        if self.destination and self.destination_path:
+            self.destination.close()
+            self.removeExpectedSizeFromStoredHeaders()
+
+    def handleResponse_withCompletionHandler_(
+            self, response, completionHandler):
+        '''Handle the response to the connection'''
         self.response = response
         self.bytesReceived = 0
         self.percentComplete = -1
@@ -294,7 +448,7 @@ class Gurl(NSObject):
             # Headers and status code only available for HTTP/S transfers
             self.status = response.statusCode()
             self.headers = dict(response.allHeaderFields())
-            normalized_headers = self.normalize_header_dict(self.headers)
+            normalized_headers = self.normalizeHeaderDict_(self.headers)
             if 'last-modified' in normalized_headers:
                 download_data['last-modified'] = normalized_headers[
                     'last-modified']
@@ -308,7 +462,7 @@ class Gurl(NSObject):
         if not self.destination and self.destination_path:
             if self.status == 206 and self.resume:
                 # 206 is Partial Content response
-                stored_data = self.get_stored_headers()
+                stored_data = self.getStoredHeaders()
                 if (not stored_data or
                         stored_data.get('etag') != download_data.get('etag') or
                         stored_data.get('last-modified') != download_data.get(
@@ -317,7 +471,12 @@ class Gurl(NSObject):
                     # we have a partial for
                     self.log(
                         'Can\'t resume download; file on server has changed.')
-                    connection.cancel()
+                    if completionHandler:
+                        # tell the session task to cancel
+                        completionHandler(NSURLSessionResponseCancel)
+                    else:
+                        # cancel the connection
+                        self.connection.cancel()
                     self.log('Removing %s' % self.destination_path)
                     os.unlink(self.destination_path)
                     # restart and attempt to download the entire file
@@ -333,96 +492,117 @@ class Gurl(NSObject):
                 self.bytesReceived = local_filesize
                 self.expectedLength += local_filesize
                 # open file for append
-                self.destination = open(self.destination_path, 'a')
+                self.destination = open(self.destination_path, 'ab')
 
             elif str(self.status).startswith('2'):
                 # not resuming, just open the file for writing
-                self.destination = open(self.destination_path, 'w')
+                self.destination = open(self.destination_path, 'wb')
                 # store some headers with the file for use if we need to resume
-                # the downloadand for future checking if the file on the server
+                # the download and for future checking if the file on the server
                 # has changed
-                self.store_headers(download_data)
+                self.storeHeaders_(download_data)
 
-    def connection_willSendRequest_redirectResponse_(
-            self, connection, request, response):
+        if completionHandler:
+            # tell the session task to continue
+            completionHandler(NSURLSessionResponseAllow)
+
+    def URLSession_dataTask_didReceiveResponse_completionHandler_(
+            self, _session, _task, response, completionHandler):
+        '''NSURLSessionDataDelegate method'''
+        if CALLBACK_HELPER_AVAILABLE:
+            completionHandler.__block_signature__ = objc_method_signature(b'v@i')
+        self.handleResponse_withCompletionHandler_(response, completionHandler)
+
+    def connection_didReceiveResponse_(self, _connection, response):
         '''NSURLConnectionDataDelegate delegate method
-        Sent when the connection determines that it must change URLs in order to
-        continue loading a request.'''
+        Sent when the connection has received sufficient data to construct the
+        URL response for its request.'''
+        self.handleResponse_withCompletionHandler_(response, None)
 
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
-        if response == None:
-            # This isn't a real redirect, this is without talking to a server.
-            # Pass it back as-is
+    def handleRedirect_newRequest_withCompletionHandler_(
+            self, response, request, completionHandler):
+        '''Handle the redirect request'''
+        def allowRedirect():
+            '''Allow the redirect'''
+            if completionHandler:
+                completionHandler(request)
+                return None
             return request
-        # But if we're here, it appears to be a real redirect attempt
+
+        def denyRedirect():
+            '''Deny the redirect'''
+            if completionHandler:
+                completionHandler(None)
+            return None
+
+        newURL = request.URL().absoluteString()
+        if response is None:
+            # the request has changed the NSURLRequest in order to standardize
+            # its format, for example, changing a request for
+            # http://www.apple.com to http://www.apple.com/. This occurs because
+            # the standardized, or canonical, version of the request is used for
+            # cache management. Pass the request back as-is
+            # (it appears that at some point Apple also defined a redirect like
+            # http://developer.apple.com to https://developer.apple.com to be
+            # 'merely' a change in the canonical URL.)
+            # Further -- it appears that this delegate method isn't called at
+            # all in this scenario, unlike NSConnectionDelegate method
+            # connection:willSendRequest:redirectResponse:
+            # we'll leave this here anyway in case we're wrong about that
+            self.log('Allowing redirect to: %s' % newURL)
+            return allowRedirect()
+        # If we get here, it appears to be a real redirect attempt
         # Annoyingly, we apparently can't get access to the headers from the
         # site that told us to redirect. All we know is that we were told
         # to redirect and where the new location is.
-        newURL = request.URL().absoluteString()
         self.redirection.append([newURL, dict(response.allHeaderFields())])
-        if self.follow_redirects:
+        newParsedURL = urlparse(newURL)
+        # This code was largely based on the work of Andreas Fuchs
+        # (https://github.com/munki/munki/pull/465)
+        if self.follow_redirects is True or self.follow_redirects == 'all':
             # Allow the redirect
             self.log('Allowing redirect to: %s' % newURL)
-            return request
-        else:
-            # Deny the redirect
-            self.log('Denying redirect to: %s' % newURL)
-            return None
+            return allowRedirect()
+        elif (self.follow_redirects == 'https'
+              and newParsedURL.scheme == 'https'):
+            # Once again, allow the redirect
+            self.log('Allowing redirect to: %s' % newURL)
+            return allowRedirect()
+        # If we're down here either the preference was set to 'none',
+        # the url we're forwarding on to isn't https or follow_redirects
+        # was explicitly set to False
+        self.log('Denying redirect to: %s' % newURL)
+        return denyRedirect()
 
-    def connection_willSendRequestForAuthenticationChallenge_(
-            self, connection, challenge):
-        '''NSURLConnection delegate method
-        Tells the delegate that the connection will send a request for an
-        authentication challenge.
-        New in 10.7.'''
-
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
-        self.log('connection_willSendRequestForAuthenticationChallenge_')
-        protectionSpace = challenge.protectionSpace()
-        host = protectionSpace.host()
-        realm = protectionSpace.realm()
-        authenticationMethod = protectionSpace.authenticationMethod()
+    # we don't control the API, so
+    # pylint: disable=too-many-arguments
+    def URLSession_task_willPerformHTTPRedirection_newRequest_completionHandler_(
+            self, _session, _task, response, request, completionHandler):
+        '''NSURLSessionTaskDelegate method'''
         self.log(
-            'Authentication challenge for Host: %s Realm: %s AuthMethod: %s'
-            % (host, realm, authenticationMethod))
-        if challenge.previousFailureCount() > 0:
-            # we have the wrong credentials. just fail
-            self.log('Previous authentication attempt failed.')
-            challenge.sender().cancelAuthenticationChallenge_(challenge)
-        if self.username and self.password and authenticationMethod in [
-                'NSURLAuthenticationMethodDefault',
-                'NSURLAuthenticationMethodHTTPBasic',
-                'NSURLAuthenticationMethodHTTPDigest']:
-            self.log('Will attempt to authenticate.')
-            self.log('Username: %s Password: %s'
-                     % (self.username, ('*' * len(self.password or ''))))
-            credential = (
-                NSURLCredential.credentialWithUser_password_persistence_(
-                    self.username, self.password,
-                    NSURLCredentialPersistenceNone))
-            challenge.sender().useCredential_forAuthenticationChallenge_(
-                credential, challenge)
-        else:
-            # fall back to system-provided default behavior
-            self.log('Allowing OS to handle authentication request')
-            challenge.sender(
-                ).performDefaultHandlingForAuthenticationChallenge_(
-                    challenge)
+            'URLSession_task_willPerformHTTPRedirection_newRequest_'
+            'completionHandler_')
+        if CALLBACK_HELPER_AVAILABLE:
+            completionHandler.__block_signature__ = objc_method_signature(b'v@@')
+        self.handleRedirect_newRequest_withCompletionHandler_(
+            response, request, completionHandler)
+    # pylint: enable=too-many-arguments
+
+    def connection_willSendRequest_redirectResponse_(
+            self, _connection, request, response):
+        '''NSURLConnectionDataDelegate method
+        Sent when the connection determines that it must change URLs in order
+        to continue loading a request.'''
+        self.log('connection_willSendRequest_redirectResponse_')
+        return self.handleRedirect_newRequest_withCompletionHandler_(
+            response, request, None)
 
     def connection_canAuthenticateAgainstProtectionSpace_(
-            self, connection, protectionSpace):
+            self, _connection, protectionSpace):
         '''NSURLConnection delegate method
         Sent to determine whether the delegate is able to respond to a
         protection space’s form of authentication.
         Deprecated in 10.10'''
-
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
         # this is not called in 10.5.x.
         self.log('connection_canAuthenticateAgainstProtectionSpace_')
         if protectionSpace:
@@ -442,17 +622,9 @@ class Gurl(NSObject):
         self.log('Allowing OS to handle authentication request')
         return False
 
-    def connection_didReceiveAuthenticationChallenge_(
-            self, connection, challenge):
-        '''NSURLConnection delegate method
-        Sent when a connection must authenticate a challenge in order to
-        download its request.
-        Deprecated in 10.10'''
-
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
-
-        self.log('connection_didReceiveAuthenticationChallenge_')
+    def handleChallenge_withCompletionHandler_(
+            self, challenge, completionHandler):
+        '''Handle an authentication challenge'''
         protectionSpace = challenge.protectionSpace()
         host = protectionSpace.host()
         realm = protectionSpace.realm()
@@ -463,7 +635,14 @@ class Gurl(NSObject):
         if challenge.previousFailureCount() > 0:
             # we have the wrong credentials. just fail
             self.log('Previous authentication attempt failed.')
-            challenge.sender().cancelAuthenticationChallenge_(challenge)
+            if completionHandler:
+                completionHandler(
+                    NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                    None)
+            else:
+                challenge.sender().cancelAuthenticationChallenge_(challenge)
+
+        # Handle HTTP Basic and Digest challenge
         if self.username and self.password and authenticationMethod in [
                 'NSURLAuthenticationMethodDefault',
                 'NSURLAuthenticationMethodHTTPBasic',
@@ -475,27 +654,162 @@ class Gurl(NSObject):
                 NSURLCredential.credentialWithUser_password_persistence_(
                     self.username, self.password,
                     NSURLCredentialPersistenceNone))
-            challenge.sender().useCredential_forAuthenticationChallenge_(
-                credential, challenge)
+            if completionHandler:
+                completionHandler(
+                    NSURLSessionAuthChallengeUseCredential, credential)
+            else:
+                challenge.sender().useCredential_forAuthenticationChallenge_(
+                    credential, challenge)
+
+        # Handle Client Certificate challenge
+        elif authenticationMethod == 'NSURLAuthenticationMethodClientCertificate':
+            self.log('Client certificate required')
+
+            # get issuers info from the response
+            expected_issuer_dicts = []
+            for dn in protectionSpace.distinguishedNames():
+                raw = dn.bytes().tobytes()
+                name = Name.load(raw)
+                expected_issuer_dicts.append(dict(name.native))
+                self.log('Accepted certificate-issuing authority: %s'
+                         % name.human_friendly)
+            if not expected_issuer_dicts:
+                self.log("The server didn't sent the list of "
+                         "acceptable certificate-issuing authorities")
+                if completionHandler:
+                    completionHandler(
+                        NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                        None
+                    )
+                else:
+                    challenge.sender().cancelAuthenticationChallenge_(challenge)
+
+            # search for a matching identity (cert paired with private key)
+            status, identity_refs = SecItemCopyMatching(
+                {kSecClass: kSecClassIdentity,
+                 kSecReturnRef: kCFBooleanTrue,
+                 kSecMatchLimit: kSecMatchLimitAll},
+                None
+            )
+            if status != errSecSuccess:
+                self.log('Could not list keychain certificates %s' % status)
+                if completionHandler:
+                    completionHandler(
+                        NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                        None
+                    )
+                else:
+                    challenge.sender().cancelAuthenticationChallenge_(challenge)
+                # return since error getting certs from keychain
+                # (identity_refs is None, crashes if we fall through to loop)
+                return
+
+            # loop through results to find cert that matches issuer
+            for identity_ref in identity_refs:
+                status, cert_ref = SecIdentityCopyCertificate(identity_ref, None)
+                if status != errSecSuccess:
+                    continue
+                cert_data = SecCertificateCopyData(cert_ref)
+                cert = Certificate.load(cert_data.bytes().tobytes())
+                issuer_dict = dict(cert.native["tbs_certificate"]["issuer"])
+                if issuer_dict in expected_issuer_dicts:
+                    self.log("Found matching identity")
+                    break
+            else:
+                self.log('Could not find matching identity')
+                if completionHandler:
+                    completionHandler(
+                        NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                        None
+                    )
+                else:
+                    challenge.sender().cancelAuthenticationChallenge_(challenge)
+                # return since didn't find matching identity
+                return
+
+            self.log("Will attempt to authenticate")
+            credential = NSURLCredential.credentialWithIdentity_certificates_persistence_(
+                identity_ref,
+                None,
+                NSURLCredentialPersistenceForSession
+            )
+            if completionHandler:
+                completionHandler(
+                    NSURLSessionAuthChallengeUseCredential, credential)
+            else:
+                challenge.sender().useCredential_forAuthenticationChallenge_(
+                    credential, challenge)
         else:
             # fall back to system-provided default behavior
-            self.log('Continuing without credential.')
-            challenge.sender(
-                ).continueWithoutCredentialForAuthenticationChallenge_(
-                    challenge)
+            self.log('Allowing OS to handle authentication request')
+            if completionHandler:
+                completionHandler(
+                    NSURLSessionAuthChallengePerformDefaultHandling, None)
+            else:
+                if (challenge.sender().respondsToSelector_(
+                        'performDefaultHandlingForAuthenticationChallenge:')):
+                    self.log('Allowing OS to handle authentication request')
+                    challenge.sender(
+                        ).performDefaultHandlingForAuthenticationChallenge_(
+                            challenge)
+                else:
+                    # Mac OS X 10.6 doesn't support
+                    # performDefaultHandlingForAuthenticationChallenge:
+                    self.log('Continuing without credential.')
+                    challenge.sender(
+                        ).continueWithoutCredentialForAuthenticationChallenge_(
+                            challenge)
 
-    def connection_didReceiveData_(self, connection, data):
-        '''NSURLConnectionDataDelegate method
-        Sent as a connection loads data incrementally'''
+    def connection_willSendRequestForAuthenticationChallenge_(
+            self, _connection, challenge):
+        '''NSURLConnection delegate method
+        Tells the delegate that the connection will send a request for an
+        authentication challenge. New in 10.7.'''
+        self.log('connection_willSendRequestForAuthenticationChallenge_')
+        self.handleChallenge_withCompletionHandler_(challenge, None)
 
-        # we don't actually use the connection argument, so
-        # pylint: disable=W0613
+    def URLSession_task_didReceiveChallenge_completionHandler_(
+            self, _session, _task, challenge, completionHandler):
+        '''NSURLSessionTaskDelegate method'''
+        if CALLBACK_HELPER_AVAILABLE:
+            completionHandler.__block_signature__ = objc_method_signature(b'v@i@')
+        self.log('URLSession_task_didReceiveChallenge_completionHandler_')
+        self.handleChallenge_withCompletionHandler_(
+            challenge, completionHandler)
 
+    def connection_didReceiveAuthenticationChallenge_(
+            self, _connection, challenge):
+        '''NSURLConnection delegate method
+        Sent when a connection must authenticate a challenge in order to
+        download its request. Deprecated in 10.10'''
+        self.log('connection_didReceiveAuthenticationChallenge_')
+        self.handleChallenge_withCompletionHandler_(challenge, None)
+
+    def handleReceivedData_(self, data):
+        '''Handle received data'''
         if self.destination:
-            self.destination.write(str(data))
+            self.destination.write(data)
         else:
-            self.log(str(data).decode('UTF-8'))
+            try:
+                self.log(str(data))
+            except Exception:
+                pass
         self.bytesReceived += len(data)
         if self.expectedLength != NSURLResponseUnknownLength:
+            # pylint: disable=old-division
             self.percentComplete = int(
                 float(self.bytesReceived)/float(self.expectedLength) * 100.0)
+            # pylint: enable=old-division
+
+    def URLSession_dataTask_didReceiveData_(self, _session, _task, data):
+        '''NSURLSessionDataDelegate method'''
+        self.handleReceivedData_(data)
+
+    def connection_didReceiveData_(self, _connection, data):
+        '''NSURLConnectionDataDelegate method
+        Sent as a connection loads data incrementally'''
+        self.handleReceivedData_(data)
+
+
+if __name__ == '__main__':
+    print('This is a library of support tools for the Munki Suite.')

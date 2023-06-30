@@ -1,54 +1,87 @@
 #!/bin/bash
 #
-# Check out Munki from git and build an mpkg distribution package.
+# Check out Munki source from GitHub and build a distribution package.
 
 
 # Defaults.
-PKGTYPE="bundle"
 PKGID="com.googlecode.munki"
-OUTPUTDIR=`pwd`
-CONFPKG=""
+OUTPUTDIR="$(pwd)"
 CHECKOUTREV="HEAD"
-BRANCH="master"
+BRANCH="main"
 
 
 usage() {
     cat <<EOF
-Usage: `basename $0` [-f] [-i id] [-o dir] [-c package] [-r revision]"
+Usage: $(basename "$0") [-b branch ] [-r revision] [<make_munki_mpkg.sh options>]"
 
-    -f          Build a flat package (bundle is the default)
-    -i id       Set the base package bundle ID
-    -o dir      Set the output directory
-    -c package  Include a configuration package
-    -b branch   Git branch to clone (master is the default)
+    -b branch   Git branch to clone (main is the default)
     -r revision Git revision to check out (HEAD is the default)
+
+    The remaining options are passed to make_munki_pkg.sh:
+    -i id       Specify the base package bundle ID
+    -o dir      Specify the output directory
+    -n orgname  Specify the name of the organization
+    -p          Build Python.framework even if one exists
+    -B          Include a package that sets Munki's bootstrap mode
+    -A          Auto run managedsoftwareupdate immediately after install. This
+                really should be used only with DEP/ADM enrollments.
+    -c plist    Build a configuration package using the preferences defined in a
+                plist file
+    -R          Include a pkg to install Rosetta2 on ARM-based hardware.
+    -s cert_cn  Sign distribution package with a Developer ID Installer
+                certificate from keychain. Provide the certificate's Common
+                Name. Ex: "Developer ID Installer: Munki (U8PN57A5N2)"
+    -S cert_cn  Sign apps with a Developer ID Application certificate from
+                keychain. Provide the certificate's Common Name.
+                Ex: "Developer ID Application: Munki (U8PN57A5N2)"
+    -T pemfile  Include a pkg to install a client certificate for server mTLS
+                mutual authentication, at /Library/Managed Installs/certs/.
 
 EOF
 }
 
-
-while getopts "fi:r:o:b:c:h" option
+ADDITIONALARGS=""
+while getopts "b:r:i:o:n:c:s:S:T:pBAhR" option
 do
     case $option in
-        "f")
-            echo "Flat metapackage creation is not yet implemented."
-            exit 1
-            PKGTYPE="flat"
-            ;;
-        "i")
-            PKGID="$OPTARG"
-            ;;
-        "o")
-            OUTPUTDIR="$OPTARG"
-            ;;
         "b")
             BRANCH="$OPTARG"
             ;;
-        "c")
-            CONFPKG="$OPTARG"
-            ;;
         "r")
             CHECKOUTREV="$OPTARG"
+            ;;
+        "i")
+            ADDITIONALARGS="${ADDITIONALARGS} -i \"$OPTARG\""
+            ;;
+        "o")
+            ADDITIONALARGS="${ADDITIONALARGS} -o \"$OPTARG\""
+            ;;
+        "n")
+            ADDITIONALARGS="${ADDITIONALARGS} -n \"$OPTARG\""
+            ;;
+        "c")
+            ADDITIONALARGS="${ADDITIONALARGS} -c \"$OPTARG\""
+            ;;
+        "s")
+            ADDITIONALARGS="${ADDITIONALARGS} -s \"$OPTARG\""
+            ;;
+        "S")
+            ADDITIONALARGS="${ADDITIONALARGS} -S \"$OPTARG\""
+            ;;
+        "p")
+            ADDITIONALARGS="${ADDITIONALARGS} -p"
+            ;;
+        "B")
+            ADDITIONALARGS="${ADDITIONALARGS} -B"
+            ;;
+        "A")
+            ADDITIONALARGS="${ADDITIONALARGS} -A"
+            ;;
+        "R")
+            ADDITIONALARGS="${ADDITIONALARGS} -R"
+            ;;
+        "T")
+            ADDITIONALARGS="${ADDITIONALARGS} -T \"$OPTARG\""
             ;;
         "h" | *)
             usage
@@ -63,26 +96,15 @@ if [ $# -ne 0 ]; then
     exit 1
 fi
 
-MUNKIDIR=`pwd`/"munki-git"
+MUNKIDIR="$(pwd)/munki-git"
 
 # Sanity checks.
-GIT=`which git`
-WHICH_GIT_RESULT="$?"
-if [ "$WHICH_GIT_RESULT" != "0" ]; then
+if ! which git 1>/dev/null ; then
     echo "Could not find git in command path. Maybe it's not installed?" 1>&2
     echo "You can get a Git package here:" 1>&2
-    echo "    http://code.google.com/p/git-osx-installer/downloads/list"
+    echo "    https://git-scm.com/download/mac"
     exit 1
 fi
-if [ ! -x "/Developer/usr/bin/packagemaker" ]; then
-    echo "PackageMaker is not installed!" 1>&2
-    exit 1
-fi
-if [ ! -x "/usr/bin/xcodebuild" ]; then
-    echo "Xcode is not installed!" 1>&2
-    exit 1
-fi
-
 
 echo "Cloning munki repo branch $BRANCH from github..."
 git clone --branch "$BRANCH" --no-checkout -- https://github.com/munki/munki.git "$MUNKIDIR"
@@ -101,13 +123,8 @@ if [ "$CHECKOUT_RESULT" != "0" ]; then
     exit 1
 fi
 
-if [ ! -z "$CONFPKG" ]; then
-    CONFPKGARG="-c $CONFPKG"
-else
-    CONFPKGARG=""
-fi
-
 # now use the version of the make_munki_mpkg.sh script in the Git repo.
-"$MUNKIDIR/code/tools/make_munki_mpkg.sh" -i "$PKGID" -r "$MUNKIDIR" -o "$OUTPUTDIR" $CONFPKGARG
+CMD="\"$MUNKIDIR/code/tools/make_munki_mpkg.sh\" -r \"$MUNKIDIR\" -o \"$OUTPUTDIR\" $ADDITIONALARGS"
+eval $CMD
 
 exit $?
